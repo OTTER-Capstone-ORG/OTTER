@@ -114,6 +114,26 @@ type ViewEntry = {
   visualIndex: number;
 };
 
+type AudioViewport = {
+  sourcePath: string;
+start: number;
+end: number;
+}
+
+let importedViewport: AudioViewport | null = null;
+let recordedViewport: AudioViewport | null = null;
+
+function viewportContains(
+  viewport: AudioViewport | null,
+  time: number
+) {
+  return (
+    viewport &&
+    time >= viewport.start &&
+    time <= viewport.end
+  );
+}
+
 type EdlV1Entry = {
   id: string;
   sourceStart: number;
@@ -123,6 +143,15 @@ type EdlV1Entry = {
   sourceFile?: string;
 };
 
+type ClipKind = "imported"| "recorded";
+
+type ClipSource = {
+  id: string;
+  kind: ClipKind;
+  audioPath: string;
+  label:string;
+}
+
 type OtterApi = {
   chooseAudioFile: () => Promise<string | null>;
   transcribeAudio: (audioPath: string, spec?: TranscribeSpec) => Promise<TranscribeAudioResult>;
@@ -130,6 +159,7 @@ type OtterApi = {
   probeAudio: (audioPath: string) => Promise<{ start_time: number; sample_rate: number | null }>;
   onTranscribeProgress: (cb: (pct: number) => void) => void;
   makeSnippet: (audioPath: string, startSec: number, durSec: number) => Promise<string>;
+  audioSection:(audioPath: string,viewportStart: number, viewportEnd: number) => Promise<ArrayBuffer>;
   readFileAsArrayBuffer: (filePath: string) => Promise<ArrayBuffer>;
   listSpecFiles: () => Promise<string[]>;
   readSpecFile: (name: string) => Promise<string>;
@@ -140,9 +170,9 @@ type OtterApi = {
   renderEditedPreview: (edlJson: string) => Promise<string>;
   saveMicRecording: (data: ArrayBuffer, mimeType: string) => Promise<string>;
   saveMicRecordingAs: (data: ArrayBuffer, mimeType: string) => Promise<string | null>;
-  pauseTranscription: () => Promise<boolean>;
-  resumeTranscription: () => Promise<boolean>;
-  cancelTranscription: () => Promise<boolean>;
+  pauseTranscription: () => Promise<{ok: boolean}>;
+  resumeTranscription: () => Promise<{ok: boolean}>;
+  cancelTranscription: () => Promise<{ok:boolean}>;
 };
 
 declare global {
@@ -158,6 +188,8 @@ declare global {
 const SEEK_EPS = 0.01;
 const DETAIL_PAD_BEFORE = 0.25; // seconds
 const DETAIL_PAD_AFTER  = 0.25; // seconds
+const VIEWPORT_DURATION_SEC = 120; //MAX viewport length
+const VIEWPORT_HALF_SEC = VIEWPORT_DURATION_SEC /2;// HALF viewport length
 
 
 //
@@ -274,9 +306,9 @@ type EditorState = {
   interactionMode: InteractionMode;
 };
 
-let importedEditor: EditorState;
-let pendingImportEditor: EditorState;
-let recordedEditor: EditorState;
+let importedEditor: EditorState; //final/main transcript
+let pendingImportEditor: EditorState;// imported staging
+let recordedEditor: EditorState;// recorded staging
 let activeEditor: EditorState;
 let playheadIndex = -1;
 let isDragging = false;
@@ -325,6 +357,8 @@ let dragMoveEditorKind: EditorKind | null = null;
 let isEditedPreviewMode = false;
 let previewWordTimes: Array<{ start: number; end: number }> = [];
 let previewRefreshToken = 0;
+let importedViewportLoading = false;
+let recordedViewportLoading = false;
 // Used to gate UI behaviors / debugging; kept for future progress UI.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 let isRefreshingPreview = false;
@@ -457,6 +491,31 @@ function getViewEntries(pt: PieceTableData): ViewEntry[] {
  */
 function getActiveEntries(pt: PieceTableData): ViewEntry[] {
   return getViewEntries(pt).filter(v => v.status !== "deleted");
+}
+
+
+function getClipSources(): ClipSource[] {
+  const clips: ClipSource[] = [];
+
+  if (pendingImportEditor.audioPath) {
+    clips.push({
+      id: "pending-import",
+      kind: "imported",
+      audioPath: pendingImportEditor.audioPath,
+      label: "Imported Clip",
+    });
+  }
+
+  if (recordedEditor.audioPath) {
+    clips.push({
+      id: "recorded",
+      kind: "recorded",
+      audioPath: recordedEditor.audioPath,
+      label: "Recorded Clip",
+    });
+  }
+
+  return clips;
 }
 
 /**
@@ -623,6 +682,102 @@ async function refreshDetailIfActive(): Promise<void> {
     console.error("Failed to refresh detail view:", err);
   }
 }
+async function ensureImportedViewport(
+  seekTime: number
+): Promise<AudioViewport | null> {
+  if (
+    pendingImportEditor.audioPath &&
+    !viewportContains(importedViewport, seekTime)
+  ) {
+    importedViewport = await loadWaveformWindow(
+      wsImported,
+      pendingImportEditor.audioPath,
+      Math.max(0, seekTime - VIEWPORT_HALF_SEC),
+      seekTime + VIEWPORT_HALF_SEC
+    );
+  }
+
+  return importedViewport;
+}
+
+async function ensureRecordedViewport(
+  seekTime: number
+): Promise<AudioViewport | null> {
+  if (
+    recordedEditor.audioPath &&
+    !viewportContains(recordedViewport, seekTime)
+  ) {
+    recordedViewport = await loadWaveformWindow(
+      wsRecorded,
+      recordedEditor.audioPath,
+      Math.max(0, seekTime - VIEWPORT_HALF_SEC),
+      seekTime + VIEWPORT_HALF_SEC
+    );
+  }
+
+  return recordedViewport;
+}
+
+async function advanceImportedViewport(){
+  if (!importedViewport || importedViewportLoading){
+    return;
+  }
+
+  importedViewportLoading = true;
+  try{
+    const absoluteTime = viewportToAbsoluteTime(importedViewport,wsImported.getCurrentTime());
+    const wasPlaying = wsImported.isPlaying();
+    importedViewport = await loadWaveformWindow(wsImported,importedViewport.sourcePath,importedViewport.start +VIEWPORT_HALF_SEC, importedViewport.end +VIEWPORT_HALF_SEC);
+    wsImported.setTime(absoluteToViewportTime(importedViewport,absoluteTime));
+
+    if (wasPlaying){
+      wsImported.play()
+    }
+  } finally{
+    importedViewportLoading = false;
+  }
+  
+}
+
+async function advanceRecordedViewport() {
+  if (!recordedViewport || recordedViewportLoading) {
+    return;
+  }
+
+  recordedViewportLoading = true;
+
+  try {
+    const absoluteTime =
+      viewportToAbsoluteTime(
+        recordedViewport,
+        wsRecorded.getCurrentTime()
+      );
+
+    const wasPlaying = wsRecorded.isPlaying();
+
+    recordedViewport =
+      await loadWaveformWindow(
+        wsRecorded,
+        recordedViewport.sourcePath,
+        recordedViewport.start + VIEWPORT_HALF_SEC,
+        recordedViewport.end + VIEWPORT_HALF_SEC
+      );
+
+    wsRecorded.setTime(
+      absoluteToViewportTime(
+        recordedViewport,
+        absoluteTime
+      )
+    );
+
+    if (wasPlaying) {
+      wsRecorded.play();
+    }
+  } finally {
+    recordedViewportLoading = false;
+  }
+}
+
 
 
 /**
@@ -987,6 +1142,17 @@ function updateDeletedRegions() {
     });
     i = j;
   }
+}
+
+function absoluteToViewportTime(viewport: AudioViewport, absoluteTime: number){
+  return absoluteTime - viewport.start;
+}
+
+function viewportToAbsoluteTime(
+  viewport: AudioViewport,
+  viewportTime: number
+) {
+  return viewport.start + viewportTime;
 }
 
 
@@ -1436,37 +1602,26 @@ findInput.addEventListener("keydown", (event: KeyboardEvent) => {
 function clearSearchHighlights() {
   const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
 
-  for (let i = 0; i < transcriptWords.length; i++) {
-    const wordElement = transcriptWords[i] as HTMLElement;
+  transcriptWords.forEach((node)=> {
+    const wordElement = node as HTMLElement;
     const index = Number(wordElement.dataset.index);
-    const wordText = activeEditor.words[index].word;    
-    wordElement.innerHTML = wordText + " ";
-  }
+    const wordText = activeEditor.words[index]?.word ?? "";
+    renderHighlightedWord(wordElement, wordText, "");
+  });
 }
 
-  findInput.addEventListener("input", () =>{
-    const searchQuery = findInput.value.trim().toLowerCase();
-    const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
-   
-    for(let i = 0; i < transcriptWords.length; i++)
-    {
-      const wordElement = transcriptWords[i] as HTMLElement;
-      const index = Number(wordElement.dataset.index);
-      const wordText = activeEditor.words[index].word;
-      wordElement.innerHTML = wordText + " ";
-      const matchPosition = wordText.toLowerCase().indexOf(searchQuery)
-      if(matchPosition === -1)
-      {
-        continue;
-      }
-      
-      const before = wordText.slice(0,matchPosition);
-      const matchingChar = wordText.slice(matchPosition, matchPosition + searchQuery.length);
-      const after = wordText.slice(matchPosition + searchQuery.length);
-      wordElement.innerHTML=  before +'<span class="highlight">' + matchingChar + '</span>' +after +" ";
-    }
+findInput.addEventListener("input", () => {
+  const searchQuery = findInput.value.trim().toLowerCase();
+  const transcriptWords = activeEditor.paneEl.querySelectorAll(".word");
 
-})
+  transcriptWords.forEach((node)=> {
+    const wordElement = node as HTMLElement;
+    const index = Number(wordElement.dataset.index);
+    const wordText = activeEditor.words[index]?.word ?? "";
+
+    renderHighlightedWord(wordElement, wordText, searchQuery);
+  });
+});
 function uniqueSortedIndices(indices: number[]): number[] {
   const unique = Array.from(new Set(indices));
   unique.sort((a, b) => a - b);
@@ -1720,6 +1875,22 @@ function setPlayheadIndex(idx: number) {
     const el = transcriptEl.querySelector(`.word[data-index="${idx}"]`);
     if (el) el.classList.add("playhead");
   }
+
+}
+
+async function loadWaveformWindow(
+  wsInstance: any,
+  audioPath: string,
+  start: number,
+  end: number
+) {
+  const wav = await otter.audioSection(audioPath, start, end);
+
+  await wsInstance.loadBlob(
+    new Blob([wav], { type: "audio/wav" })
+  );
+
+  return {sourcePath: audioPath, start, end};
 }
 
 /**
@@ -1762,13 +1933,18 @@ function computeDetailWindow(start: number, end: number) {
  */
 async function loadDetailForRange(sourceFile: string, start: number, end: number) {
   if (!sourceFile) throw new Error("No audio loaded");
-  const { winStart, winDur } = computeDetailWindow(start, end);
+  const { winStart, winEnd } = computeDetailWindow(start, end);
+
+  // Map the range's absolute times into snippet-local times
+  const localRangeStart = start - winStart;
+  const localRangeEnd = end - winStart;
 
   // Create a short WAV snippet around the selected word (main process uses ffmpeg)
-  const snippetPath = await otter.makeSnippet(sourceFile, winStart, winDur);
-
-  // If the detail waveform is currently playing, stop it before swapping media
-  if (wsDetail.isPlaying()) wsDetail.pause();
+  const wav = await otter.audioSection(
+    sourceFile,
+    winStart,
+    winEnd
+  );
 
   // Enable/show detail UI now that detail audio exists
   waveDetailPane.hidden = false;
@@ -1777,17 +1953,17 @@ async function loadDetailForRange(sourceFile: string, start: number, end: number
   btnRegion.disabled = false;
   setDetailPlayIcon(false);
 
-  // Map the range's absolute times into snippet-local times
-  const localRangeStart = start - winStart;
-  const localRangeEnd = end - winStart;
 
-  // Attach the handler BEFORE calling load() to avoid missing "ready" in fast loads
+  // Attach ready handler BEFORE loading
   wsDetail.once("ready", () => {
     setDetailWordRegion(localRangeStart, localRangeEnd);
     wsDetail.setTime(localRangeStart);
   });
+  
+  await wsDetail.loadBlob(
+    new Blob([wav], { type: "audio/wav" })
+  );
 
-  await wsDetail.load(snippetPath);
 }
 
 /**
@@ -1965,9 +2141,21 @@ function renderTranscript(editor: EditorState) {
         ws.setTime(seekTime + SEEK_EPS);
         setPlayheadIndex(i);
       } else if (editor.kind === "pending-import") {
-        wsImported.setTime(Number(w.start) + SEEK_EPS);
-      } else {
-        wsRecorded.setTime(Number(w.start) + SEEK_EPS);
+        const seekTime = Number(w.start);
+        const vp = await ensureImportedViewport(seekTime);
+
+        if(vp){
+          wsImported.setTime(absoluteToViewportTime(vp,seekTime)+ SEEK_EPS);
+        }
+  
+      } else if (editor.kind === "recorded"){
+        const seekTime = Number(w.start);
+        const vp = await ensureRecordedViewport(seekTime)
+
+        if(vp){
+          wsRecorded.setTime( absoluteToViewportTime(vp,seekTime) + SEEK_EPS);
+        }
+        
       }
 
       // Load the detail waveform snippet centered on the selected range
@@ -2070,6 +2258,41 @@ function initializeDragEnd() {
   });
 }
 
+function renderHighlightedWord(
+  wordElement: HTMLElement,
+  wordText: string,
+  searchQuery: string
+) {
+  wordElement.replaceChildren();
+
+  if (!searchQuery) {
+    wordElement.textContent = wordText + " ";
+    return;
+  }
+
+  const lowerWord = wordText.toLowerCase();
+  const lowerQuery = searchQuery;
+  const matchPosition = lowerWord.indexOf(lowerQuery);
+
+  if (matchPosition === -1) {
+    wordElement.textContent = wordText + " ";
+    return;
+  }
+
+  const before = wordText.slice(0, matchPosition);
+  const match = wordText.slice(matchPosition, matchPosition + searchQuery.length);
+  const after = wordText.slice(matchPosition + searchQuery.length);
+
+  wordElement.appendChild(document.createTextNode(before));
+
+  const mark = document.createElement("span");
+  mark.className = "highlight";
+  mark.textContent = match;
+  wordElement.appendChild(mark);
+
+  wordElement.appendChild(document.createTextNode(after + " "));
+}
+
 //==============================================================================
 //
 // BEGIN: Objects and code related to the Wave Pane
@@ -2146,8 +2369,19 @@ function setImportedPlayIcon(isPlaying: boolean) {
 wsImported.on("play", () => setImportedPlayIcon(true));
 wsImported.on("pause", () => setImportedPlayIcon(false));
 wsImported.on("finish", () => setImportedPlayIcon(false));
-wsImported.on("timeupdate", (t: number) => {
-  importedTimeEl.textContent = `${t.toFixed(2)}s`;
+wsImported.on("timeupdate", async (t: number) => {
+  if(!importedViewport) return;
+  importedTimeEl.textContent =
+  `${viewportToAbsoluteTime(
+      importedViewport,
+      t
+    ).toFixed(2)}s`;
+
+  const absoluteTime = viewportToAbsoluteTime(importedViewport, t);
+
+  if (absoluteTime > importedViewport.end-10){
+    await advanceImportedViewport();
+  }
 });
 
 btnImportedPlay.addEventListener("click", () => {
@@ -2164,8 +2398,23 @@ wsRecorded.on("play", () => setRecordedPlayIcon(true));
 wsRecorded.on("pause", () => setRecordedPlayIcon(false));
 wsRecorded.on("finish", () => setRecordedPlayIcon(false));
 
-wsRecorded.on("timeupdate", (t: number) => {
-  recordedTimeEl.textContent = `${t.toFixed(2)}s`;
+wsRecorded.on("timeupdate", async (t: number) => {
+  if(!recordedViewport)return;
+  recordedTimeEl.textContent =
+  `${viewportToAbsoluteTime(
+      recordedViewport,
+      t
+    ).toFixed(2)}s`;
+
+    const absoluteTime = viewportToAbsoluteTime(recordedViewport, t);
+    
+    if (
+      absoluteTime >
+      recordedViewport.end - 10
+    ) {
+      await advanceRecordedViewport();
+    }
+
 });
 
 btnRecordedPlay.addEventListener("click", () => {
@@ -2656,8 +2905,8 @@ btnTranscribe.addEventListener("click", async () => {
 // Handle the "Pause / Resume" button
 btnPause.addEventListener("click", async () => {
   if (!isPaused) {
-    const ok = await otter.pauseTranscription();
-    if (!ok) {
+    const result = await otter.pauseTranscription();
+    if (!result.ok) {
       setStatus("Unable to pause transcription.", "error");
       return;
     }
@@ -2665,8 +2914,8 @@ btnPause.addEventListener("click", async () => {
     btnPause.textContent = "▶ Resume";
     setStatus("Transcription paused.", "info");
   } else {
-    const ok = await otter.resumeTranscription();
-    if (!ok) {
+    const result = await otter.resumeTranscription();
+    if (!result.ok) {
       setStatus("Unable to resume transcription.", "error");
       return;
     }
@@ -2749,8 +2998,7 @@ btnRecord.addEventListener("click", async () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
 
-        const recAb = await otter.readFileAsArrayBuffer(wavPath);
-        await wsRecorded.loadBlob(new Blob([recAb]));
+        recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
 
@@ -2831,9 +3079,7 @@ btnChoose.addEventListener("click", async () => {
   importedLoadedFileEl.textContent = shortenFilenameMiddle(fname);
   btnImportedPlay.disabled = true;
   importedTimeEl.textContent = "0.00";
-  const ab = await otter.readFileAsArrayBuffer(pendingImportAudioPath);
-  const blob = new Blob([ab]);
-  await wsImported.loadBlob(blob);
+  importedViewport = await loadWaveformWindow(wsImported,pendingImportAudioPath,0,120);
   btnImportedPlay.disabled = false;
   setImportedPlayIcon(false);
 });
@@ -3214,8 +3460,8 @@ btnUndo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-          await wsImported.loadBlob(new Blob([importAb]));
+
+          importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
         } catch {
@@ -3237,8 +3483,7 @@ btnUndo.addEventListener("click", () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-          await wsRecorded.loadBlob(new Blob([recAb]));
+          recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
         } catch {
@@ -3283,8 +3528,7 @@ btnRedo.addEventListener("click", () => {
         importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
         btnImportedPlay.disabled = true;
         try {
-          const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-          await wsImported.loadBlob(new Blob([importAb]));
+          importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
           btnImportedPlay.disabled = false;
           setImportedPlayIcon(false);
         } catch {
@@ -3306,8 +3550,7 @@ btnRedo.addEventListener("click", () => {
         btnTranscribeRecorded.disabled = false;
         btnStopRecorded.hidden = true;
         try {
-          const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-          await wsRecorded.loadBlob(new Blob([recAb]));
+          recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
           btnRecordedPlay.disabled = false;
           setRecordedPlayIcon(false);
         } catch {
@@ -3771,8 +4014,7 @@ btnLoadEdl.addEventListener("click", async () => {
       importedLoadedFileEl.textContent = shortenFilenameMiddle((pendingImportEditor.audioPath.split("/").pop() ?? pendingImportEditor.audioPath));
       btnImportedPlay.disabled = true;
       try {
-        const importAb = await otter.readFileAsArrayBuffer(pendingImportEditor.audioPath);
-        await wsImported.loadBlob(new Blob([importAb]));
+        importedViewport = await loadWaveformWindow(wsImported,pendingImportEditor.audioPath,0,120);
         btnImportedPlay.disabled = false;
         setImportedPlayIcon(false);
       } catch (err: unknown) {
@@ -3796,8 +4038,7 @@ btnLoadEdl.addEventListener("click", async () => {
       btnTranscribeRecorded.disabled = false;
       btnStopRecorded.hidden = true;
       try {
-        const recAb = await otter.readFileAsArrayBuffer(recordedEditor.audioPath);
-        await wsRecorded.loadBlob(new Blob([recAb]));
+        recordedViewport = await loadWaveformWindow(wsRecorded,recordedEditor.audioPath,0,120);
         btnRecordedPlay.disabled = false;
         setRecordedPlayIcon(false);
       } catch (err: unknown) {
